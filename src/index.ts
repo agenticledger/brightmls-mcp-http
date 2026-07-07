@@ -1,13 +1,26 @@
 #!/usr/bin/env node
 /**
- * Bright MLS MCP Server — Exposed via Streamable HTTP
+ * BrightMLS MCP Server — Streamable HTTP, BROKER-FIRST (auth model "B").
  *
- * Auth model: Dual-mode — supports both direct Bearer passthrough
- * and OAuth 2.0 Client Credentials grant.
- * No permanent credentials are stored on the server.
+ * This MCP holds ZERO BrightMLS secrets. It is a *client* of the Connections Broker
+ * (https://connectionsbroker.agenticledger.ai), which vaults each user's BrightMLS
+ * API key (kind:"static") and hands it back per request. See broker-client.ts.
+ *
+ * Credential resolution (per request):
+ *   1. Raw passthrough escape hatch (holds no secret): if the caller sends
+ *      `Authorization: Bearer <brightmls-api-key>`, use it directly.
+ *   2. Broker-first (default): derive the caller's `principal`, sign a short-lived
+ *      JWT, ask the broker POST /token for the BrightMLS key, construct the client.
+ *      If not connected yet, return a connect-on-first-call message (never errors).
+ *
+ * Principal transport (the platform-gateway contract):
+ *   - `X-Broker-Principal: <instanceId>:<agentId>` set by the gateway (per-agent).
+ *   - Optional `X-Broker-Principal-Sig` (HMAC) enforced when BROKER_PRINCIPAL_HMAC_KEY
+ *     is set — makes the header unforgeable on the public Railway host.
+ *   - No header -> BROKER_FALLBACK_PRINCIPAL (standalone single-principal mode).
  */
 
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHmac } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
@@ -20,211 +33,142 @@ import {
 import { zodToJsonSchema as _zodToJsonSchema } from 'zod-to-json-schema';
 import { BrightMLSClient } from './api-client.js';
 import { tools } from './tools.js';
+import {
+  brokerConfigured,
+  brokerBaseUrl,
+  brokerClientNamespace,
+  brokerProvider,
+  brokerProviderKind,
+  resolveToken,
+  startConnect,
+} from './broker-client.js';
 
 function zodToJsonSchema(schema: any): any {
   return _zodToJsonSchema(schema);
 }
 
+// --- Config ---
 const PORT = parseInt(process.env.PORT || '3100', 10);
 const SERVER_BASE_URL = process.env.SERVER_BASE_URL || `http://localhost:${PORT}`;
 const SLUG = 'brightmls';
+const NAME = 'BrightMLS MCP Server';
+const VERSION = '2.0.0';
 
-const app = express();
-app.use(express.json());
-app.use(express.urlencoded({ extended: false }));
-
-// --- OAuth token store (in-memory, ephemeral) ---
-const TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
-
-interface OAuthToken {
-  apiKey: string;
-  expiresAt: number;
+/** Construct a BrightMLSClient from a broker-resolved (or raw passthrough) credential. */
+function makeClient(credential: string): BrightMLSClient {
+  return new BrightMLSClient(credential);
 }
 
-const oauthTokens = new Map<string, OAuthToken>();
+// --- Principal transport (platform-gateway contract) ---
+const PRINCIPAL_HEADER = (process.env.BROKER_PRINCIPAL_HEADER || 'x-broker-principal').toLowerCase();
+const PRINCIPAL_SIG_HEADER = 'x-broker-principal-sig';
+const PRINCIPAL_HMAC_KEY = process.env.BROKER_PRINCIPAL_HMAC_KEY || '';
+const FALLBACK_PRINCIPAL = process.env.BROKER_FALLBACK_PRINCIPAL || 'default';
 
-// Cleanup expired tokens every 10 minutes
-setInterval(() => {
-  const now = Date.now();
-  for (const [token, data] of oauthTokens) {
-    if (now > data.expiresAt) oauthTokens.delete(token);
+function headerValue(v: string | string[] | undefined): string | undefined {
+  return Array.isArray(v) ? v[0] : v;
+}
+
+function derivePrincipal(req: express.Request): { principal: string } | { error: string } {
+  const raw = headerValue(req.headers[PRINCIPAL_HEADER]);
+  if (raw && raw.trim()) {
+    const principal = raw.trim();
+    if (PRINCIPAL_HMAC_KEY) {
+      const sig = headerValue(req.headers[PRINCIPAL_SIG_HEADER]);
+      const expected = createHmac('sha256', PRINCIPAL_HMAC_KEY).update(principal).digest('base64url');
+      if (!sig || sig !== expected) {
+        return { error: `Missing or invalid ${PRINCIPAL_SIG_HEADER} for the supplied ${PRINCIPAL_HEADER}` };
+      }
+    }
+    return { principal };
   }
-}, 10 * 60 * 1000);
+  return { principal: FALLBACK_PRINCIPAL };
+}
 
-// --- Static assets (logo) ---
+/** Raw passthrough escape hatch — holds no secret. */
+function rawPassthrough(req: express.Request): string | null {
+  const auth = req.headers.authorization;
+  if (!auth) return null;
+  const bearer = auth.replace(/^Bearer\s+/i, '').trim();
+  return bearer || null;
+}
+
+// --- Express app ---
+const app = express();
+app.use(express.json());
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 app.use('/static', express.static(path.join(__dirname, 'public')));
 
-// Health check (no auth required)
-app.get('/health', (_req, res) => {
-  res.json({
-    status: 'ok',
-    server: 'brightmls-mcp-http',
-    version: '1.0.0',
-    tools: tools.length,
-    transport: 'streamable-http',
-    auth: 'dual-mode',
-    auth_modes: ['bearer-passthrough', 'oauth-client-credentials'],
-  });
-});
-
-// --- OAuth 2.0 Discovery ---
-// Claude-CLI OAuth-trap fix: OAuth Authorization Server metadata de-advertised.
-// The spec discovery path /.well-known/oauth-authorization-server now 404s, so Claude CLI
-// falls back to Bearer passthrough (Mode-B broker) instead of a self-hosted OAuth dance.
+// OAuth-trap fix (phase 1): keep the OAuth AS discovery path 404 so Claude CLI
+// never auto-initiates a self-hosted OAuth dance — this MCP is broker-first.
 app.get('/_disabled/oauth-authorization-server', (_req, res) => {
-  res.json({
-    issuer: SERVER_BASE_URL,
-    token_endpoint: `${SERVER_BASE_URL}/oauth/token`,
-    revocation_endpoint: `${SERVER_BASE_URL}/oauth/revoke`,
-    grant_types_supported: ['client_credentials'],
-    token_endpoint_auth_methods_supported: ['client_secret_post'],
-    response_types_supported: ['token'],
-    service_documentation: `https://financemcps.agenticledger.ai/brightmls/`,
-  });
+  res.status(404).json({ error: 'not_found' });
 });
 
-// --- OAuth 2.0 Token Exchange ---
-app.post('/oauth/token', (req, res) => {
-  const { grant_type, client_id, client_secret } = req.body;
-
-  if (grant_type !== 'client_credentials') {
-    res.status(400).json({ error: 'unsupported_grant_type', error_description: 'Only client_credentials is supported' });
-    return;
-  }
-
-  if (client_id !== SLUG) {
-    res.status(400).json({ error: 'invalid_client', error_description: `client_id must be "${SLUG}"` });
-    return;
-  }
-
-  if (!client_secret) {
-    res.status(400).json({ error: 'invalid_request', error_description: 'client_secret is required (your Bright MLS API key)' });
-    return;
-  }
-
-  const accessToken = `mcp_${randomUUID().replace(/-/g, '')}`;
-  const expiresIn = TOKEN_TTL_MS / 1000;
-
-  oauthTokens.set(accessToken, {
-    apiKey: client_secret,
-    expiresAt: Date.now() + TOKEN_TTL_MS,
-  });
-
+app.get('/', (_req, res) => {
   res.json({
-    access_token: accessToken,
-    token_type: 'bearer',
-    expires_in: expiresIn,
-  });
-});
-
-// GET handler for browsers hitting /oauth/token
-app.get('/oauth/token', (_req, res) => {
-  res.json({
-    endpoint: '/oauth/token',
-    method: 'POST',
-    description: 'Exchange your Bright MLS API key for a time-limited MCP token',
-    usage: {
-      grant_type: 'client_credentials',
-      client_id: SLUG,
-      client_secret: '<your-brightmls-api-key>',
-    },
-    example: `curl -X POST ${SERVER_BASE_URL}/oauth/token -d "grant_type=client_credentials&client_id=${SLUG}&client_secret=<your-api-key>"`,
-  });
-});
-
-// --- OAuth 2.0 Token Revocation ---
-app.post('/oauth/revoke', (req, res) => {
-  const { token } = req.body;
-  if (token) oauthTokens.delete(token);
-  res.status(200).json({ status: 'revoked' });
-});
-
-// --- Smart root route: content negotiation ---
-app.get('/', (req, res) => {
-  const accept = req.headers.accept || '';
-  if (accept.includes('text/html')) {
-    res.send(BRANDED_LANDING_HTML);
-    return;
-  }
-  res.json({
-    name: 'Bright MLS MCP Server',
+    name: NAME,
     provider: 'AgenticLedger',
-    version: '1.0.0',
-    description: 'Search properties, comps, agents, offices, schools, market stats, and open houses on Bright MLS',
+    version: VERSION,
+    description:
+      'BrightMLS Banking — accounts, transactions, recipients, payments, invoicing, and treasury operations through MCP tools.',
     mcpEndpoint: '/mcp',
     transport: 'streamable-http',
     tools: tools.length,
     auth: {
-      type: 'dual-mode',
-      description: 'Supports both direct Bearer token and OAuth 2.0 Client Credentials',
-      modes: {
-        bearer: {
-          description: 'Pass your Bright MLS API key directly as the Bearer token',
-          header: 'Authorization: Bearer <your-brightmls-api-key>',
-        },
-        oauth: {
-          description: 'Exchange credentials for a time-limited token',
-          token_endpoint: `${SERVER_BASE_URL}/oauth/token`,
-          client_id: SLUG,
-          client_secret: '<your-brightmls-api-key>',
-          grant_type: 'client_credentials',
-        },
+      model: 'broker-first',
+      description:
+        'Credentials are owned by the Connections Broker. On first use the tool returns a one-time connect link; after you connect once, calls just work. No secret is ever pasted into this MCP.',
+      broker: brokerBaseUrl,
+      principalHeader: PRINCIPAL_HEADER,
+      alternativeAuth: {
+        type: 'bearer-passthrough',
+        description: 'Escape hatch (no secret held): pass a raw BrightMLS API key as Bearer.',
       },
     },
-    configTemplate: {
-      mcpServers: {
-        'brightmls': {
-          url: `${SERVER_BASE_URL}/mcp`,
-          headers: { Authorization: 'Bearer <your-brightmls-api-key>' }
-        }
-      }
-    },
-    links: {
-      health: '/health',
-      documentation: 'https://financemcps.agenticledger.ai/brightmls/',
-      oauth_discovery: '/.well-known/oauth-authorization-server',
-    }
+    configTemplate: { mcpServers: { [SLUG]: { url: `${SERVER_BASE_URL}/mcp` } } },
+    links: { health: '/health', documentation: `https://financemcps.agenticledger.ai/${SLUG}/` },
   });
 });
 
-// --- Dual-mode API key resolver ---
-function resolveApiKey(req: express.Request): string | null {
-  const auth = req.headers.authorization;
-  if (!auth) return null;
+app.get('/health', (_req, res) => {
+  res.json({
+    status: 'ok',
+    server: `${SLUG}-mcp-http`,
+    version: VERSION,
+    tools: tools.length,
+    transport: 'streamable-http',
+    authModel: 'broker-first',
+    brokerConfigured,
+    brokerBaseUrl,
+    provider: brokerProvider,
+    providerKind: brokerProviderKind,
+    clientNamespace: brokerConfigured ? brokerClientNamespace : null,
+    authModes: [
+      'broker-first (default): resolves the BrightMLS key via the Connections Broker',
+      'bearer-passthrough (escape hatch): Authorization: Bearer <brightmls-api-key>',
+    ],
+  });
+});
 
-  const token = auth.replace(/^Bearer\s+/i, '');
-  if (!token) return null;
+// ==================== MCP SERVER ====================
 
-  // Mode 1: OAuth-issued token
-  if (token.startsWith('mcp_')) {
-    const entry = oauthTokens.get(token);
-    if (!entry) return null;
-    if (Date.now() > entry.expiresAt) {
-      oauthTokens.delete(token);
-      return null;
-    }
-    return entry.apiKey;
-  }
-
-  // Mode 2: Raw API key passthrough
-  return token;
-}
-
-// --- Per-session state ---
 interface SessionState {
   server: Server;
   transport: StreamableHTTPServerTransport;
-  client: BrightMLSClient;
 }
 
 const sessions = new Map<string, SessionState>();
 
-function createMCPServer(client: BrightMLSClient): Server {
-  const server = new Server(
-    { name: 'brightmls-mcp-server', version: '1.0.0' },
-    { capabilities: { tools: {} } }
-  );
+type ClientResolution =
+  | { kind: 'client'; client: BrightMLSClient }
+  | { kind: 'connect'; message: string }
+  | { kind: 'error'; message: string };
+
+type ClientResolver = () => Promise<ClientResolution>;
+
+function createMCPServer(resolveClient: ClientResolver): Server {
+  const server = new Server({ name: `${SLUG}-mcp-server`, version: VERSION }, { capabilities: { tools: {} } });
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: tools.map((tool) => ({
@@ -237,29 +181,49 @@ function createMCPServer(client: BrightMLSClient): Server {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
     const tool = tools.find((t) => t.name === name);
+    if (!tool) throw new Error(`Unknown tool: ${name}`);
 
-    if (!tool) {
-      throw new Error(`Unknown tool: ${name}`);
+    const resolved = await resolveClient();
+    if (resolved.kind === 'connect') {
+      return { content: [{ type: 'text' as const, text: resolved.message }] };
+    }
+    if (resolved.kind === 'error') {
+      return { content: [{ type: 'text' as const, text: `Error: ${resolved.message}` }], isError: true };
     }
 
     try {
-      const result = await tool.handler(client, args as any);
-      return {
-        content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }],
-      };
+      const result = await tool.handler(resolved.client, args as any);
+      return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      return {
-        content: [{ type: 'text' as const, text: `Error: ${message}` }],
-        isError: true,
-      };
+      return { content: [{ type: 'text' as const, text: `Error: ${message}` }], isError: true };
     }
   });
 
   return server;
 }
 
-// --- Streamable HTTP endpoint ---
+/** Build the connect-on-first-call structured message. */
+async function connectMessage(principal: string): Promise<string> {
+  const started = await startConnect(principal);
+  if ('error' in started) {
+    return `BrightMLS isn't connected for this caller yet, and starting a connection failed: ${started.error}`;
+  }
+  return JSON.stringify(
+    {
+      status: 'connection_required',
+      provider: brokerProvider,
+      message:
+        brokerProviderKind === 'static'
+          ? 'BrightMLS is not connected for this caller yet. Connect it once via the link below (paste your BrightMLS API key into your platform’s broker connect flow), then run the tool again — it will work.'
+          : 'BrightMLS is not connected for this caller yet. Open the connect link below once, then run the tool again — it will work.',
+      connectUrl: started.authorizeUrl,
+    },
+    null,
+    2
+  );
+}
+
 app.post('/mcp', async (req, res) => {
   const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
@@ -269,26 +233,37 @@ app.post('/mcp', async (req, res) => {
     return;
   }
 
-  const apiKey = resolveApiKey(req);
-  if (!apiKey) {
-    res.status(401).json({
-      error: 'Missing or invalid Authorization header.',
-      modes: {
-        bearer: 'Authorization: Bearer <your-brightmls-api-key>',
-        oauth: `POST ${SERVER_BASE_URL}/oauth/token with client_id=${SLUG}&client_secret=<your-brightmls-api-key>&grant_type=client_credentials`,
-      },
-    });
-    return;
+  let resolveClient: ClientResolver;
+
+  const raw = rawPassthrough(req);
+  if (raw) {
+    const client = makeClient(raw);
+    resolveClient = async () => ({ kind: 'client', client });
+  } else {
+    if (!brokerConfigured) {
+      res.status(503).json({
+        error: 'Broker not configured on this server.',
+        hint: 'Set BROKER_INSTALL_BEARER, BROKER_JWT_KEY, BROKER_CLIENT_NAMESPACE (from the broker /register).',
+        alternative: { Authorization: 'Bearer <your-brightmls-api-key>' },
+      });
+      return;
+    }
+    const derived = derivePrincipal(req);
+    if ('error' in derived) {
+      res.status(401).json({ error: derived.error });
+      return;
+    }
+    const principal = derived.principal;
+    resolveClient = async () => {
+      const tok = await resolveToken(principal);
+      if (tok.status === 'connected') return { kind: 'client', client: makeClient(tok.accessToken) };
+      if (tok.status === 'not_connected') return { kind: 'connect', message: await connectMessage(principal) };
+      return { kind: 'error', message: tok.message };
+    };
   }
 
-  const baseUrl = process.env.BRIGHT_MLS_BASE_URL || undefined;
-  const client = new BrightMLSClient(apiKey, baseUrl);
-
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => randomUUID(),
-  });
-
-  const server = createMCPServer(client);
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => randomUUID() });
+  const server = createMCPServer(resolveClient);
 
   transport.onclose = () => {
     const sid = transport.sessionId;
@@ -303,8 +278,8 @@ app.post('/mcp', async (req, res) => {
 
   const newSessionId = transport.sessionId;
   if (newSessionId) {
-    sessions.set(newSessionId, { server, transport, client });
-    console.log(`[mcp] New session: ${newSessionId}`);
+    sessions.set(newSessionId, { server, transport });
+    console.log(`[mcp] New session: ${newSessionId} (mode: ${raw ? 'passthrough' : 'broker'})`);
   }
 });
 
@@ -331,108 +306,12 @@ app.delete('/mcp', async (req, res) => {
   res.status(200).json({ status: 'session closed' });
 });
 
-// ==================== BRANDED HTML HELPER PAGE ====================
-const BRANDED_LANDING_HTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Bright MLS MCP Server — AgenticLedger</title>
-  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-  <style>
-    :root{--primary:#2563EB;--primary-dark:#1D4ED8;--primary-light:#DBEAFE;--primary-50:#EFF6FF;--fg:#0F172A;--muted:#64748B;--surface:#F8FAFC;--border:#E2E8F0;--success:#10B981;--success-light:#D1FAE5;}
-    *{margin:0;padding:0;box-sizing:border-box;}
-    body{font-family:'DM Sans',sans-serif;color:var(--fg);min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--surface);background-image:linear-gradient(135deg,var(--primary-50) 0%,var(--surface) 50%,#F0F9FF 100%);background-size:400% 400%;animation:gradientShift 15s ease infinite;}
-    @keyframes gradientShift{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
-    .card{background:#fff;border:1px solid var(--border);border-radius:16px;padding:40px;max-width:560px;width:100%;margin:20px;box-shadow:0 1px 3px rgba(0,0,0,.04),0 8px 24px rgba(0,0,0,.06);animation:slideUp .5s ease-out;}
-    @keyframes slideUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
-    .header{display:flex;align-items:center;gap:14px;margin-bottom:28px;padding-bottom:20px;border-bottom:1px solid var(--border);}
-    .header img{height:36px;}
-    .header span{font-size:18px;font-weight:700;color:var(--fg);}
-    .status-badge{display:inline-flex;align-items:center;gap:6px;background:var(--success-light);border:1px solid #A7F3D0;border-radius:20px;padding:6px 14px;font-size:13px;font-weight:600;color:#065F46;margin-bottom:20px;}
-    .status-badge::before{content:'';width:8px;height:8px;border-radius:50%;background:var(--success);animation:pulse 2s infinite;}
-    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-    .info-grid{display:grid;gap:12px;margin-bottom:24px;}
-    .info-row{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;background:var(--primary-50);border-radius:10px;font-size:13px;}
-    .info-row .label{color:var(--muted);font-weight:500;}
-    .info-row .value{color:var(--fg);font-weight:600;font-family:'JetBrains Mono',monospace;font-size:12px;}
-    .section-title{font-size:14px;font-weight:600;color:var(--fg);margin:24px 0 10px;display:flex;align-items:center;gap:8px;}
-    .key-input{width:100%;padding:12px 16px;border:2px solid var(--border);border-radius:10px;font-family:'JetBrains Mono',monospace;font-size:13px;transition:border-color .2s;margin-bottom:8px;}
-    .key-input:focus{outline:none;border-color:var(--primary);}
-    .key-hint{font-size:12px;color:var(--muted);margin-bottom:20px;line-height:1.5;}
-    .config-block{position:relative;}
-    .config-pre{background:#1E293B;border-radius:12px;padding:20px;overflow-x:auto;font-family:'JetBrains Mono',monospace;font-size:12.5px;line-height:1.7;margin:0 0 24px;color:#E2E8F0;white-space:pre;}
-    .config-copy{position:absolute;top:12px;right:12px;background:rgba(255,255,255,.1);color:#CBD5E1;border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:6px 12px;font-family:'DM Sans',sans-serif;font-size:12px;cursor:pointer;transition:all .15s;}
-    .config-copy:hover{background:rgba(255,255,255,.2);color:#fff;}
-    .config-copy.copied{background:rgba(16,185,129,.3);color:#86EFAC;}
-    .trust{display:flex;gap:16px;flex-wrap:wrap;padding-top:20px;border-top:1px solid var(--border);}
-    .trust-item{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);}
-    .trust-item svg{width:14px;height:14px;color:var(--success);}
-    .footer{padding-top:16px;border-top:1px solid var(--border);text-align:center;font-size:12px;color:var(--muted);margin-top:20px;}
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="header"><img src="/static/logo.png" alt="AgenticLedger"><span>Bright MLS MCP</span></div>
-    <div class="status-badge">Server Online</div>
-    <div class="info-grid">
-      <div class="info-row"><span class="label">Tools</span><span class="value">${tools.length}</span></div>
-      <div class="info-row"><span class="label">Transport</span><span class="value">Streamable HTTP</span></div>
-      <div class="info-row"><span class="label">Auth</span><span class="value">Dual-Mode (Bearer + OAuth)</span></div>
-    </div>
-
-    <div class="section-title">Enter your Bright MLS API Key</div>
-    <input type="text" class="key-input" id="apiKeyInput" placeholder="your-api-key..." oninput="updateConfig()">
-    <div class="key-hint">Your key stays in your browser — it is never sent to this server.</div>
-
-    <div class="section-title">MCP Configuration (Bearer)</div>
-    <p style="font-size:13px;color:var(--muted);margin-bottom:12px;">Add to your <strong style="color:var(--fg)">claude_desktop_config.json</strong> or <strong style="color:var(--fg)">.mcp.json</strong>:</p>
-    <div class="config-block">
-      <button class="config-copy" onclick="copyBlock('configBlock',this)">Copy</button>
-      <pre class="config-pre" id="configBlock"></pre>
-    </div>
-
-    <div class="section-title">OAuth Configuration (Claude.ai / Agent Platforms)</div>
-    <p style="font-size:13px;color:var(--muted);margin-bottom:12px;">For platforms that require OAuth Client Credentials:</p>
-    <div class="config-block">
-      <button class="config-copy" onclick="copyBlock('oauthBlock',this)">Copy</button>
-      <pre class="config-pre" id="oauthBlock"></pre>
-    </div>
-
-    <div class="trust">
-      <div class="trust-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>No credentials stored</div>
-      <div class="trust-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>Stateless</div>
-      <div class="trust-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>Per-session auth</div>
-    </div>
-    <div class="footer">Powered by AgenticLedger &middot; <a href="https://financemcps.agenticledger.ai/" target="_blank" style="color:var(--primary);text-decoration:none">Explore Other MCPs</a></div>
-  </div>
-  <script>
-    function updateConfig(){
-      var key=document.getElementById('apiKeyInput').value||'<your-brightmls-api-key>';
-      var config=JSON.stringify({mcpServers:{"brightmls":{url:"${SERVER_BASE_URL}/mcp",headers:{Authorization:"Bearer "+key}}}},null,2);
-      document.getElementById('configBlock').textContent=config;
-      var oauth="Token URL:      ${SERVER_BASE_URL}/oauth/token\\nClient ID:      ${SLUG}\\nClient Secret:  "+key+"\\nGrant Type:     client_credentials";
-      document.getElementById('oauthBlock').textContent=oauth;
-    }
-    function copyBlock(id,btn){
-      var text=document.getElementById(id).textContent;
-      navigator.clipboard.writeText(text).then(function(){
-        btn.textContent='Copied!';btn.classList.add('copied');
-        setTimeout(function(){btn.textContent='Copy';btn.classList.remove('copied');},2000);
-      });
-    }
-    updateConfig();
-  </script>
-</body>
-</html>`;
-
 app.listen(PORT, () => {
-  console.log(`Bright MLS MCP HTTP Server running on port ${PORT}`);
+  console.log(`${NAME} v${VERSION} (broker-first)`);
   console.log(`  MCP endpoint:   ${SERVER_BASE_URL}/mcp`);
-  console.log(`  OAuth token:    ${SERVER_BASE_URL}/oauth/token`);
-  console.log(`  OAuth discovery: ${SERVER_BASE_URL}/.well-known/oauth-authorization-server`);
   console.log(`  Health check:   ${SERVER_BASE_URL}/health`);
-  console.log(`  Landing page:   ${SERVER_BASE_URL}/`);
   console.log(`  Tools:          ${tools.length}`);
-  console.log(`  Transport:      Streamable HTTP`);
-  console.log(`  Auth:           Dual-mode (Bearer passthrough + OAuth Client Credentials)`);
+  console.log(`  Auth model:     broker-first (${brokerConfigured ? 'broker configured' : 'BROKER NOT CONFIGURED'})`);
+  console.log(`  Broker:         ${brokerBaseUrl}`);
+  console.log(`  Provider:       ${brokerProvider} (${brokerProviderKind})`);
 });
